@@ -1,349 +1,409 @@
 #include <iostream>
-#include <vector>
+#include <unordered_set>
 #include <unordered_map>
-#include <fstream>
-#include <string>
-#include <sstream>
-#include <iomanip>    // Для std::setw
+#include <vector>
+#include <random>
 #include <chrono>
 #include <thread>
-#include <cstdlib>    // Для std::atoi
-#include <algorithm>  // Для std::find
-#include <cstdint>    // Для uint32_t
+#include <functional>
+#include <sstream>
+#include <algorithm> // для std::shuffle
+#include <fstream>   // для работы с файлами
+#include <cstring>   // для std::strcmp
+#include <cstdlib>   // для std::atoi
 
-// Глобальные переменные для размеров поля
-uint32_t ROWS = 20;
-uint32_t COLS = 20;
+// --------------------------------------------------------------
+// ОПРЕДЕЛЕНИЕ ПАРАМЕТРОВ И ТИПОВ
+// --------------------------------------------------------------
 
-// Тип сетки
-using Grid = std::vector<std::vector<int>>;
+// Флаг режима отладки
+static bool debugMode = false;
 
-// Флаги для управления выводом
-static bool debugMode = true;
+// Размер сетки (N x N). Будет определен на основе длины input_data.
+static size_t N = 20; // Значение по умолчанию, может быть изменено
 
-// Правила игры: наборы соседей для выживания и рождения
-std::vector<int> survivalRules;
-std::vector<int> birthRules;
+// Максимальное количество живых клеток. Не должно превышать N.
+static size_t maxLive = 20; // Значение по умолчанию, может быть изменено
 
-// Функция генерации правил на основе длины и суммы байт файла
-void generateRules(std::size_t fileLength, std::size_t byteSum) {
-    // Инициализация генератора случайных чисел с заданным сидом
-    unsigned int seed = static_cast<unsigned int>(fileLength + byteSum);
-    srand(seed);
+// Тип для координат клетки (строка, столбец)
+using Cell = std::pair<size_t, size_t>;
 
-    // Генерация количества правил выживания (от 1 до 3)
-    int numSurvival = rand() % 3 + 1;
-    survivalRules.clear();
-    while (survivalRules.size() < static_cast<size_t>(numSurvival)) {
-        int rule = rand() % 9; // 0-8
-        if (std::find(survivalRules.begin(), survivalRules.end(), rule) == survivalRules.end()) {
-            survivalRules.push_back(rule);
-        }
+// Пользовательская хеш-функция для Cell, используемая в unordered_set
+struct CellHash {
+    std::size_t operator()(const Cell& cell) const {
+        // Комбинируем хеши строки и столбца с использованием простого множителя
+        return std::hash<size_t>()(cell.first) * 31 + std::hash<size_t>()(cell.second);
     }
+};
 
-    // Генерация количества правил рождения (от 1 до 3)
-    int numBirth = rand() % 3 + 1;
-    birthRules.clear();
-    while (birthRules.size() < static_cast<size_t>(numBirth)) {
-        int rule = rand() % 9; // 0-8
-        if (std::find(birthRules.begin(), birthRules.end(), rule) == birthRules.end()) {
-            birthRules.push_back(rule);
-        }
+// Компаратор равенства для Cell
+struct CellEq {
+    bool operator()(const Cell& a, const Cell& b) const {
+        return (a.first == b.first) && (a.second == b.second);
     }
+};
 
-    // Вывод сгенерированных правил
-    std::cout << "Сгенерированные правила игры:\n";
-    std::cout << "Выживание (S): ";
-    for (const auto& rule : survivalRules) {
-        std::cout << rule << " ";
+// Разреженное представление сетки: множество живых клеток
+using SparseGrid = std::unordered_set<Cell, CellHash, CellEq>;
+
+// --------------------------------------------------------------
+// ФУНКЦИЯ ЛОГИРОВАНИЯ
+// --------------------------------------------------------------
+
+// Логирует сообщения, если режим отладки включен
+void logMessage(const std::string& msg) {
+    if (debugMode) {
+        std::cout << "[DEBUG] " << msg << "\n";
     }
-    std::cout << "\nРождение (B): ";
-    for (const auto& rule : birthRules) {
-        std::cout << rule << " ";
-    }
-    std::cout << "\n\n";
 }
 
-// Функция хеширования сетки
-std::size_t hashGrid(const Grid& grid) {
-    std::size_t h = 0;
-    for (const auto &row : grid) {
-        for (const auto cell : row) {
-            h ^= std::hash<int>()(cell) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        }
+// --------------------------------------------------------------
+// ГЕНЕРАЦИЯ НАЧАЛЬНОГО СОСТОЯНИЯ
+// --------------------------------------------------------------
+
+// Генерирует начальную конфигурацию с не более чем maxLive живыми клетками
+SparseGrid generateInitialConfiguration(size_t N, size_t maxLive, std::mt19937& gen) {
+    SparseGrid grid;
+    if (maxLive == 0) {
+        return grid;
     }
-    return h;
+
+    std::uniform_int_distribution<size_t> dist(0, N - 1);
+
+    while (grid.size() < maxLive) {
+        size_t r = dist(gen);
+        size_t c = dist(gen);
+        grid.emplace(r, c);
+    }
+
+    return grid;
 }
 
-// Подсчёт соседей для "Игры Жизнь"
-int countNeighbors(const Grid &g, int r, int c, bool verbose = false) {
-    int count = 0;
-    if (verbose) {
-        std::cout << "  [Debug] Подсчёт соседей для клетки (" << r << "," << c << "): ";
-    }
+// --------------------------------------------------------------
+// ПОДСЧЕТ СОСЕДЕЙ
+// --------------------------------------------------------------
+
+// Подсчитывает количество живых соседей для данной клетки
+int countNeighbors(const SparseGrid& grid, size_t r, size_t c, size_t N) {
+    int cnt = 0;
     for (int dr = -1; dr <= 1; dr++) {
         for (int dc = -1; dc <= 1; dc++) {
             if (dr == 0 && dc == 0) continue;
-            int rr = r + dr;
-            int cc = c + dc;
-            if (rr >= 0 && rr < ROWS && cc >= 0 && cc < COLS) {
-                count += g[rr][cc];
-                if (verbose) {
-                    std::cout << "[" << rr << "," << cc << "]=" << g[rr][cc] << " ";
+            ssize_t rr = static_cast<ssize_t>(r) + dr;
+            ssize_t cc = static_cast<ssize_t>(c) + dc;
+            if (rr < 0 || rr >= static_cast<ssize_t>(N) || cc < 0 || cc >= static_cast<ssize_t>(N))
+                continue;
+            if (grid.find({static_cast<size_t>(rr), static_cast<size_t>(cc)}) != grid.end()) {
+                cnt++;
+            }
+        }
+    }
+    return cnt;
+}
+
+// --------------------------------------------------------------
+// ОПРЕДЕЛЕНИЕ СЛЕДУЮЩЕГО СОСТОЯНИЯ КЛЕТКИ
+// --------------------------------------------------------------
+
+// Определяет, будет ли клетка жива в следующем поколении
+bool nextStateOfCell(const SparseGrid& grid, size_t r, size_t c, size_t N) {
+    bool isAlive = (grid.find({r, c}) != grid.end());
+    int neighbors = countNeighbors(grid, r, c, N);
+
+    if (isAlive) {
+        // Выживает, если у нее 2 или 3 живых соседа
+        return (neighbors == 2 || neighbors == 3);
+    } else {
+        // Рождается, если у нее ровно 3 живых соседа
+        return (neighbors == 3);
+    }
+}
+
+// --------------------------------------------------------------
+// ВЫЧИСЛЕНИЕ СЛЕДУЮЩЕГО ПОКОЛЕНИЯ
+// --------------------------------------------------------------
+
+// Вычисляет следующее поколение на основе текущей сетки
+SparseGrid nextGeneration(const SparseGrid& current, size_t N) {
+    SparseGrid next;
+    std::unordered_map<Cell, int, CellHash, CellEq> neighborCount;
+    neighborCount.reserve(current.size() * 9); // Грубая оценка
+
+    // 1) Определяем всех кандидатов (живые клетки и их соседи)
+    for (const auto& cell : current) {
+        size_t r = cell.first;
+        size_t c = cell.second;
+
+        for (int dr = -1; dr <= 1; dr++) {
+            for (int dc = -1; dc <= 1; dc++) {
+                ssize_t rr = static_cast<ssize_t>(r) + dr;
+                ssize_t cc = static_cast<ssize_t>(c) + dc;
+                if (rr < 0 || rr >= static_cast<ssize_t>(N) || cc < 0 || cc >= static_cast<ssize_t>(N))
+                    continue;
+                Cell candidate = {static_cast<size_t>(rr), static_cast<size_t>(cc)};
+                neighborCount[candidate] = 0; // Инициализируем счетчик
+            }
+        }
+    }
+
+    // 2) Подсчитываем количество живых соседей для каждого кандидата
+    for (const auto& cell : current) {
+        size_t r = cell.first;
+        size_t c = cell.second;
+
+        for (int dr = -1; dr <= 1; dr++) {
+            for (int dc = -1; dc <= 1; dc++) {
+                if (dr == 0 && dc == 0) continue;
+                ssize_t rr = static_cast<ssize_t>(r) + dr;
+                ssize_t cc = static_cast<ssize_t>(c) + dc;
+                if (rr < 0 || rr >= static_cast<ssize_t>(N) || cc < 0 || cc >= static_cast<ssize_t>(N))
+                    continue;
+                Cell neighbor = {static_cast<size_t>(rr), static_cast<size_t>(cc)};
+                auto it = neighborCount.find(neighbor);
+                if (it != neighborCount.end()) {
+                    it->second += 1;
                 }
             }
         }
     }
-    if (verbose) {
-        std::cout << "=> Всего живых соседей: " << count << "\n";
-    }
-    return count;
-}
 
-// Правило "Игры Жизнь" с использованием пользовательских правил
-int transitionRule(int cell, int neighbors) {
-    if (cell == 1) {
-        // Живая клетка выживает при наличии neighbors в survivalRules
-        return (std::find(survivalRules.begin(), survivalRules.end(), neighbors) != survivalRules.end()) ? 1 : 0;
-    } else {
-        // Мёртвая клетка оживает при наличии neighbors в birthRules
-        return (std::find(birthRules.begin(), birthRules.end(), neighbors) != birthRules.end()) ? 1 : 0;
-    }
-}
+    // 3) Определяем, какие клетки будут живыми в следующем поколении
+    for (const auto& kv : neighborCount) {
+        const Cell& cell = kv.first;
+        int cnt = kv.second;
+        bool aliveNow = (current.find(cell) != current.end());
+        bool aliveNext;
 
-// Выполняем один шаг (итерацию) автомата
-Grid nextGeneration(const Grid &g, bool verbose = false) {
-    Grid newG = g;
-    for (int r = 0; r < ROWS; r++) {
-        for (int c = 0; c < COLS; c++) {
-            int n = countNeighbors(g, r, c, verbose);
-            newG[r][c] = transitionRule(g[r][c], n);
+        if (aliveNow) {
+            aliveNext = (cnt == 2 || cnt == 3);
+        } else {
+            aliveNext = (cnt == 3);
+        }
+
+        if (aliveNext) {
+            next.emplace(cell);
         }
     }
-    return newG;
+
+    return next;
 }
-// Функция для вывода сетки в консоль с цветами
-void printGrid(const Grid &grid, int iteration) {
-    // ANSI код для очистки экрана и перемещения курсора в верхний левый угол
-    std::cout << "\033[2J\033[H";
-    std::cout << "Итерация: " << iteration << "\n";
-    for (int r = 0; r < ROWS; r++) {
-        for (int c = 0; c < COLS; c++) {
-            if (grid[r][c]) {
-                // Зелёный цвет для живых клеток
-                std::cout << "\033[32m██\033[0m";
-            } else {
-                // Серый цвет для мёртвых клеток
-                std::cout << "\033[90m  \033[0m";
+
+// --------------------------------------------------------------
+// ХЕШИРОВАНИЕ ВСЕГО СОСТОЯНИЯ СЕТКИ
+// --------------------------------------------------------------
+
+// Вычисляет хеш для текущего состояния сетки
+std::size_t hashGrid(const SparseGrid& grid) {
+    // Используем простое комбинирование хешей клеток с использованием простого простого множителя
+    const std::size_t prime = 1000003;
+    std::size_t h = 0;
+    for (const auto& cell : grid) {
+        std::size_t cellHash = CellHash{}(cell);
+        h = h * prime + cellHash;
+    }
+    return h;
+}
+
+// --------------------------------------------------------------
+// ВЫЧИСЛЕНИЕ ПРОСТОГО КОНТРОЛЬНОГО СУММЫ (НЕОБЯЗАТЕЛЬНО)
+// --------------------------------------------------------------
+
+// Вычисляет простую контрольную сумму для состояния сетки (необязательно, для верификации)
+std::size_t computeChecksum(const SparseGrid& grid) {
+    std::size_t checksum = 0;
+    for (const auto& cell : grid) {
+        checksum += cell.first * 31 + cell.second;
+    }
+    return checksum;
+}
+
+// --------------------------------------------------------------
+// ОБРАБОТКА ПАРАМЕТРОВ КОМАНДНОЙ СТРОКИ
+// --------------------------------------------------------------
+
+// Обрабатывает аргументы командной строки для установки параметров
+void parseArguments(int argc, char* argv[], std::string& inputDataFile, bool& debugModeFlag) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
+            inputDataFile = argv[++i];
+        } else if (std::strcmp(argv[i], "--debug") == 0) {
+            debugModeFlag = true;
+        } else if (std::strcmp(argv[i], "--help") == 0) {
+            std::cout << "Использование: " << argv[0] << " [--input <файл>] [--debug]\n";
+            exit(0);
+        } else {
+            std::cerr << "Неизвестный аргумент: " << argv[i] << "\n";
+            std::cout << "Использование: " << argv[0] << " [--input <файл>] [--debug]\n";
+            exit(1);
+        }
+    }
+}
+
+// --------------------------------------------------------------
+// ОСНОВНАЯ ФУНКЦИЯ
+// --------------------------------------------------------------
+
+int main(int argc, char* argv[]) {
+    // Инициализируем генератор случайных чисел с текущим временем для случайности
+    std::mt19937 gen(static_cast<unsigned>(std::chrono::system_clock::now().time_since_epoch().count()));
+
+    // Обрабатываем аргументы командной строки
+    std::string inputDataFile = "";
+    parseArguments(argc, argv, inputDataFile, debugMode);
+
+    // Читаем input_data
+    std::string input_data;
+    if (!inputDataFile.empty()) {
+        std::ifstream infile(inputDataFile);
+        if (!infile) {
+            std::cerr << "Ошибка: Невозможно открыть входной файл: " << inputDataFile << "\n";
+            return 1;
+        }
+        std::ostringstream ss;
+        ss << infile.rdbuf();
+        input_data = ss.str();
+        infile.close();
+    } else {
+        // Если файл не указан, запрашиваем ввод у пользователя или используем строку по умолчанию
+        std::cout << "Введите строку input_data (или оставьте пустым для использования значения по умолчанию): ";
+        std::getline(std::cin, input_data);
+        if (input_data.empty()) {
+            input_data = "DefaultInputData";
+        }
+    }
+
+    // Устанавливаем размер сетки N и максимальное количество живых клеток maxLive на основе длины input_data
+    N = input_data.size();
+    maxLive = input_data.size();
+
+    logMessage("Размер сетки установлен на " + std::to_string(N) + "x" + std::to_string(N));
+    logMessage("Максимальное количество живых клеток установлено на " + std::to_string(maxLive));
+
+    // Генерируем начальную конфигурацию
+    auto current = generateInitialConfiguration(N, maxLive, gen);
+    logMessage("Начальная конфигурация сгенерирована. Количество живых клеток = " + std::to_string(current.size()));
+
+    // Подготовка к обнаружению цикла
+    // Map: хеш -> номер итерации
+    std::unordered_map<std::size_t, size_t> visited;
+    visited.reserve(10000); // Резервируем место для 10,000 записей
+
+    // Параметры
+    size_t maxIterations = 2000; // Лимит итераций для поиска цикла
+    bool cycleFound = false;
+    size_t cycleStart = 0;
+    size_t cycleLen = 0;
+
+    // Мемоизация: сохраняем состояния на каждые 10 итераций
+    std::unordered_map<size_t, SparseGrid> memoStates;
+    memoStates.reserve(maxIterations / 10 + 1);
+
+    // Цикл симуляции
+    for (size_t iter = 0; iter < maxIterations; iter++) {
+        // Логирование каждые 10 итераций
+        if (iter % 10 == 0) {
+            std::ostringstream oss;
+            oss << "Итерация = " << iter << ", Живых клеток = " << current.size();
+            logMessage(oss.str());
+        }
+
+        // Вычисляем хеш текущего состояния сетки
+        std::size_t currentHash = hashGrid(current);
+
+        // Проверяем, не встречался ли уже такой хеш
+        auto it = visited.find(currentHash);
+        if (it != visited.end()) {
+            // Цикл обнаружен
+            cycleFound = true;
+            cycleStart = it->second;
+            cycleLen = iter - cycleStart;
+            logMessage("Цикл обнаружен! Начало цикла на итерации " + std::to_string(cycleStart) +
+                       ", Длина цикла = " + std::to_string(cycleLen) +
+                       ", Текущая итерация = " + std::to_string(iter));
+            break;
+        } else {
+            // Сохраняем текущий хеш с номером итерации
+            visited[currentHash] = iter;
+        }
+
+        // Мемоизация: сохраняем состояние каждые 10 итераций
+        if (iter % 10 == 0) {
+            memoStates[iter] = current;
+            logMessage("Состояние на итерации " + std::to_string(iter) + " сохранено для мемоизации.");
+        }
+
+        // Вычисляем следующее поколение
+        auto nxt = nextGeneration(current, N);
+        current = std::move(nxt);
+
+        // Проверяем и ограничиваем количество живых клеток до maxLive
+        if (current.size() > maxLive) {
+            size_t toRemove = current.size() - maxLive;
+            logMessage("Количество живых клеток превышает maxLive. Удаляем " + std::to_string(toRemove) + " клеток.");
+
+            // Сохраняем живые клетки в вектор для случайного удаления
+            std::vector<Cell> cells(current.begin(), current.end());
+
+            // Перемешиваем вектор для случайного порядка удаления
+            std::shuffle(cells.begin(), cells.end(), gen);
+
+            // Удаляем первые 'toRemove' клеток из перемешанного списка
+            for (size_t i = 0; i < toRemove && i < cells.size(); ++i) {
+                current.erase(cells[i]);
+                logMessage("Удалена клетка (" + std::to_string(cells[i].first) + ", " +
+                           std::to_string(cells[i].second) + ")");
             }
+        }
+
+        // Дополнительно: можно добавить паузу для наблюдения (опционально)
+        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // Отчет после завершения симуляции
+    if (cycleFound) {
+        std::cout << "Цикл обнаружен!\n";
+        std::cout << "Цикл начинается с итерации " << cycleStart << " и имеет длину " << cycleLen << ".\n";
+
+        // Пример: доступ к состоянию на определенной итерации с использованием информации о цикле
+        size_t queryIter;
+        std::cout << "Введите номер итерации для получения состояния: ";
+        std::cin >> queryIter;
+
+        if (queryIter < cycleStart) {
+            // Если запрашиваемая итерация была мемоизирована
+            auto it_memo = memoStates.find(queryIter);
+            if (it_memo != memoStates.end()) {
+                std::cout << "Состояние на итерации " << queryIter << " получено из мемоизации.\n";
+                // Здесь можно добавить код для отображения или обработки состояния
+            } else {
+                std::cout << "Состояние на итерации " << queryIter << " не было мемоизировано.\n";
+            }
+        } else {
+            // Вычисляем эквивалентную итерацию внутри цикла
+            size_t equivalentIter = cycleStart + ((queryIter - cycleStart) % cycleLen);
+            auto it_memo = memoStates.find(equivalentIter);
+            if (it_memo != memoStates.end()) {
+                std::cout << "Состояние на итерации " << queryIter << " соответствует итерации " <<
+                             equivalentIter << " внутри цикла.\n";
+                // Здесь можно добавить код для отображения или обработки состояния
+            } else {
+                std::cout << "Эквивалентное состояние для итерации " << queryIter << " не было мемоизировано.\n";
+            }
+        }
+    } else {
+        std::cout << "Цикл не обнаружен за " << maxIterations << " итераций.\n";
+        std::cout << "Состояния каждые 10 итераций были мемоизированы для быстрого доступа.\n";
+    }
+
+    // Отчет о финальном состоянии
+    std::cout << "Финальное количество живых клеток: " << current.size() << "\n";
+    if (debugMode) {
+        std::cout << "Финальные живые клетки:\n";
+        for (const auto& cell : current) {
+            std::cout << "(" << cell.first << ", " << cell.second << ") ";
         }
         std::cout << "\n";
     }
-    // Разделительная линия
-    std::cout << std::string(COLS * 2, '-') << "\n";
-}
-
-// Функция для чтения файла и инициализации сетки в бинарном режиме
-bool readInputFile(const std::string& filename, Grid& grid, std::size_t& fileLength, std::size_t& byteSum) {
-    std::ifstream infile(filename, std::ios::binary);
-    if (!infile.is_open()) {
-        std::cerr << "Ошибка: Не удалось открыть файл " << filename << "\n";
-        return false;
-    }
-
-    // Чтение первых 8 байт для ROWS и COLS
-    uint32_t rows = 0, cols = 0;
-    infile.read(reinterpret_cast<char*>(&rows), sizeof(uint32_t));
-    infile.read(reinterpret_cast<char*>(&cols), sizeof(uint32_t));
-
-    // Обновление глобальных переменных
-    ROWS = rows;
-    COLS = cols;
-
-    if (ROWS <= 0 || COLS <= 0) {
-        std::cerr << "Ошибка: Размеры поля должны быть положительными.\n";
-        return false;
-    }
-
-    // Инициализируем сетку
-    grid.assign(ROWS, std::vector<int>(COLS, 0));
-
-    // Чтение последующих ROWS * COLS байтов для инициализации клеток
-    std::vector<char> buffer(ROWS * COLS, 0);
-    infile.read(buffer.data(), buffer.size());
-
-    // Вычисление длины файла и суммы байт
-    infile.seekg(0, std::ios::end);
-    fileLength = infile.tellg();
-    infile.seekg(0, std::ios::beg); // Сброс позиции на начало файла
-
-    byteSum = 0;
-    for (const auto& byte : buffer) {
-        byteSum += static_cast<unsigned char>(byte);
-    }
-
-    // Инициализация сетки
-    for (int r = 0; r < ROWS; r++) {
-        for (int c = 0; c < COLS; c++) {
-            grid[r][c] = static_cast<unsigned char>(buffer[r * COLS + c]) ? 1 : 0;
-        }
-    }
-
-    infile.close();
-
-    return true;
-}
-
-// Функция для парсинга аргументов командной строки
-bool parseArguments(int argc, char* argv[], std::string& inputFile) {
-    for(int i =1; i < argc; i++) {
-        std::string arg = argv[i];
-        if(arg == "--file") {
-            if(i +1 < argc) {
-                inputFile = argv[i+1];
-                i++; // Пропускаем следующий аргумент, так как он уже прочитан
-            } else {
-                std::cerr << "Ошибка: Опция --file требует аргумент (имя файла).\n";
-                return false;
-            }
-        }
-        else if(arg == "--debug") {
-            debugMode = true;
-        }
-        else {
-            std::cerr << "Предупреждение: Неизвестный аргумент \"" << arg << "\"\n";
-        }
-    }
-
-    if(inputFile.empty()) {
-        std::cerr << "Ошибка: Необходимо указать входной файл через опцию --file.\n";
-        return false;
-    }
-
-    return true;
-}
-
-int main(int argc, char* argv[]) {
-    // Парсинг аргументов командной строки
-    std::string inputFile;
-    if(!parseArguments(argc, argv, inputFile)) {
-        std::cerr << "Использование: " << argv[0] << " --file <input_file> [--debug]\n";
-        return 1;
-    }
-
-    Grid grid;
-    std::size_t fileLength = 0;
-    std::size_t byteSum = 0;
-
-    // Чтение и инициализация сетки из файла
-    if (!readInputFile(inputFile, grid, fileLength, byteSum)) {
-        return 1; // Ошибка при чтении файла
-    }
-
-    // Генерация правил на основе длины и суммы байт файла
-    generateRules(fileLength, byteSum);
-    // Вывод начального состояния, если включён режим отладки
-    if (debugMode) {
-        std::cout << "Начальное состояние:\n";
-        for (int r = 0; r < ROWS; r++) {
-            for (int c = 0; c < COLS; c++) {
-                std::cout << (grid[r][c] ? "██" : "  ");
-            }
-            std::cout << "\n";
-        }
-        std::cout << std::string(COLS * 2, '-') << "\n";
-    }
-
-    // Словарь «хеш -> номер итерации» для обнаружения циклов
-    std::unordered_map<std::size_t, int> visited;
-    // Запоминаем начальное состояние
-    std::size_t h0 = hashGrid(grid);
-    visited[h0] = 0;
-
-    // Ограничение — до скольки итераций мы ищем цикл
-    const int MAX_ITER = 2000;
-
-    bool cycleFound = false;
-    int cycleStart  = -1;
-    int cycleLen    = -1;
-
-    Grid current = grid;
-
-    // Цикл итераций
-    for (int iter = 1; iter <= MAX_ITER; iter++) {
-        // Печать текущего состояния
-        printGrid(current, iter - 1);
-
-        // Считаем следующее поколение
-        Grid newGrid = nextGeneration(current, debugMode);
-        current = newGrid;
-
-        // Хешируем
-        std::size_t h = hashGrid(current);
-
-        if (debugMode) {
-            std::cout << "  [Debug] Хеш текущего состояния: " << h << "\n";
-        }
-
-        // Проверяем на повтор
-        if (visited.find(h) != visited.end()) {
-            // Цикл найден!
-            cycleFound = true;
-            cycleStart = visited[h];
-            cycleLen   = iter - cycleStart;
-            std::cout << "Найден цикл!\n"
-                      << "Начало цикла на итерации " << cycleStart
-                      << ", длина цикла: " << cycleLen << "\n";
-            break;
-        } else {
-            visited[h] = iter;
-        }
-
-        // Опционально: подсчёт и вывод количества живых клеток
-        if (debugMode) {
-            int liveCells = 0;
-            for (const auto &row : current) {
-                for (auto cell : row) liveCells += cell;
-            }
-            std::cout << "  [Debug] Количество живых клеток: " << liveCells << "\n";
-        }
-
-        // Задержка для удобства наблюдения
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    // Печатаем последнее состояние, если цикл не найден
-    if (!cycleFound) {
-        printGrid(current, MAX_ITER);
-    }
-
-    // Решаем, "стоит ли строить" (вести автомат дальше)
-    // Предположим, нам нужны циклы длиной ровно 10
-    const int REQUIRED_CYCLE_LEN = 10;
-
-    if (cycleFound) {
-        if (cycleLen == REQUIRED_CYCLE_LEN) {
-            std::cout << "Цикл подходит! Делаем дальнейшие построения.\n";
-            // Пример: анимируем цикл несколько раз
-            for (int i = 0; i < cycleLen; i++) {
-                printGrid(current, cycleStart + i);
-                current = nextGeneration(current, debugMode);
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-        } else {
-            std::cout << "Цикл не подходит (нужен " << REQUIRED_CYCLE_LEN
-                      << ", найден " << cycleLen << "). Останавливаемся.\n";
-            return 0;
-        }
-    } else {
-        std::cout << "Цикл не найден (за " << MAX_ITER << " итераций). "
-                  << "Останавливаемся.\n";
-        return 0;
-    }
-
-    // Дополнительный код, который продолжает работу с автоматом
-    std::cout << "Автомат с нужной длиной цикла найден, продолжаем...\n";
-    // ... ваш дальнейший код ...
 
     return 0;
 }
